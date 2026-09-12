@@ -97,16 +97,36 @@ curl -X POST https://backend-dusky-ten-yhsqmecen5.vercel.app/api/orders/checkout
 ```
 Check `GET /api/products` before and after — stock should decrease immediately.
 
-### 3. Concurrency Test (No Overselling)
-Set a product's stock to a small number (e.g. `2`), then fire two simultaneous checkout requests for `quantity: 2` each — e.g. using two terminals at the same time:
+### 3. Concurrency Test (No Overselling) — Verified ✅
 
-```bash
-curl -X POST https://backend-dusky-ten-yhsqmecen5.vercel.app/api/orders/checkout \
-  -H "Content-Type: application/json" \
-  -d '{"items":[{"productId":"<PRODUCT_ID>","quantity":2}]}'
+Tested by creating a product with `stock: 2`, then firing two truly simultaneous checkout requests for `quantity: 2` each, using PowerShell background jobs so both requests hit the server at the same moment:
+
+```powershell
+$job1 = Start-Job -ScriptBlock {
+    param($prodId)
+    Invoke-RestMethod -Uri "http://localhost:5000/api/orders/checkout" -Method POST `
+      -ContentType "application/json" `
+      -Body "{`"items`":[{`"productId`":`"$prodId`",`"quantity`":2}]}"
+} -ArgumentList $productId
+
+$job2 = Start-Job -ScriptBlock {
+    param($prodId)
+    Invoke-RestMethod -Uri "http://localhost:5000/api/orders/checkout" -Method POST `
+      -ContentType "application/json" `
+      -Body "{`"items`":[{`"productId`":`"$prodId`",`"quantity`":2}]}"
+} -ArgumentList $productId
+
+Wait-Job $job1, $job2 | Out-Null
+Receive-Job $job1
+Receive-Job $job2
 ```
 
-**Expected result**: only ONE request succeeds (`201 Reserved`); the other receives `409 Insufficient stock`. Final stock never goes negative. This is guaranteed by the atomic `findOneAndUpdate` filter (`stock: { $gte: quantity }`) running inside a MongoDB transaction.
+**Actual result:**
+- Request 1 → `201 Reserved` — order created successfully (`totalAmount: 200`)
+- Request 2 → `409 { "error": "Insufficient stock for product ..." }`
+- Final stock after both requests: `0` (never went negative)
+
+This confirms the atomic `findOneAndUpdate` filter (`stock: { $gte: quantity }`), executed inside a MongoDB transaction, correctly prevents overselling even when two requests arrive for the same product at the same instant.
 
 ### 4. Reservation Expiry
 Checkout an item, note the `reservedUntil` timestamp (5 minutes ahead). Wait 5+ minutes, then `GET /api/orders/:id` — the order status will automatically flip to `Expired` and the stock will be restored (lazy-check on read).
