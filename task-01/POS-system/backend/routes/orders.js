@@ -37,13 +37,12 @@ async function releaseIfExpired(order) {
 
 // CREATE ORDER (checkout) — reserves stock atomically using a DB transaction
 router.post("/checkout", async (req, res) => {
-  const { items, idempotencyKey } = req.body; // items: [{ productId, quantity }]
+  const { items, idempotencyKey } = req.body;
 
   if (!items || items.length === 0) {
     return res.status(400).json({ error: "Cart is empty" });
   }
 
-  // Duplicate order detection — same idempotency key can't create two orders
   if (idempotencyKey) {
     const existing = await Order.findOne({ paymentAttemptId: idempotencyKey });
     if (existing) {
@@ -65,7 +64,6 @@ router.post("/checkout", async (req, res) => {
           throw new Error(`Invalid quantity for product ${productId}`);
         }
 
-        // ATOMIC stock check-and-decrement inside the transaction
         const product = await Product.findOneAndUpdate(
           { _id: productId, stock: { $gte: quantity } },
           { $inc: { stock: -quantity } },
@@ -100,7 +98,8 @@ router.post("/checkout", async (req, res) => {
       createdOrder = order;
     });
 
-    res.status(201).json(createdOrder);
+    const populated = await Order.findById(createdOrder._id).populate("items.product", "name price");
+    res.status(201).json(populated);
   } catch (err) {
     res.status(409).json({ error: err.message });
   } finally {
@@ -110,7 +109,7 @@ router.post("/checkout", async (req, res) => {
 
 // MOCK PAYMENT
 router.post("/:id/pay", async (req, res) => {
-  const { outcome, paymentAttemptId } = req.body; // outcome: "success" | "fail" | "timeout"
+  const { outcome, paymentAttemptId } = req.body;
 
   const session = await mongoose.startSession();
 
@@ -126,7 +125,6 @@ router.post("/:id/pay", async (req, res) => {
       });
     }
 
-    // Duplicate payment detection
     if (paymentAttemptId && order.paymentAttemptId === paymentAttemptId) {
       return res.status(409).json({ error: "Duplicate payment attempt" });
     }
@@ -151,12 +149,14 @@ router.post("/:id/pay", async (req, res) => {
         await order.save({ session });
       });
     } else if (outcome === "timeout") {
-      return res.json({ message: "Payment timed out, awaiting expiry", order });
+      const populated = await Order.findById(order._id).populate("items.product", "name price");
+      return res.json({ message: "Payment timed out, awaiting expiry", order: populated });
     } else {
       return res.status(400).json({ error: "Invalid outcome" });
     }
 
-    res.json(order);
+    const populated = await Order.findById(order._id).populate("items.product", "name price");
+    res.json(populated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
@@ -193,7 +193,8 @@ router.post("/:id/cancel", async (req, res) => {
       await order.save({ session });
     });
 
-    res.json(order);
+    const populated = await Order.findById(order._id).populate("items.product", "name price");
+    res.json(populated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   } finally {
@@ -204,7 +205,7 @@ router.post("/:id/cancel", async (req, res) => {
 // GET single order (lazy-checks expiry every time it's read)
 router.get("/:id", async (req, res) => {
   try {
-    let order = await Order.findById(req.params.id);
+    let order = await Order.findById(req.params.id).populate("items.product", "name price");
     if (!order) return res.status(404).json({ error: "Order not found" });
     order = await releaseIfExpired(order);
     res.json(order);
@@ -213,10 +214,12 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-// GET all orders
+// GET all orders (order history — includes product names)
 router.get("/", async (req, res) => {
   try {
-    let orders = await Order.find().sort({ createdAt: -1 });
+    let orders = await Order.find()
+      .sort({ createdAt: -1 })
+      .populate("items.product", "name price");
     orders = await Promise.all(orders.map(releaseIfExpired));
     res.json(orders);
   } catch (err) {

@@ -376,8 +376,18 @@ function App() {
                       {order.status}
                     </span>
                   </div>
-                  <p className="text-sm text-slate-500 mb-1">Order ID: {order._id.slice(-8)}</p>
-                  <p className="text-sm text-slate-700 mb-4">
+                  <p className="text-sm text-slate-500 mb-2">Order ID: {order._id.slice(-8)}</p>
+
+                  <div className="mb-3 space-y-1">
+                    {order.items.map((it, idx) => (
+                      <p key={idx} className="text-sm text-slate-600">
+                        {it.product?.name || "Product"} x{it.quantity} — Rs.{" "}
+                        {(it.priceAtOrder * it.quantity).toFixed(2)}
+                      </p>
+                    ))}
+                  </div>
+
+                  <p className="text-sm text-slate-700 mb-4 border-t border-slate-100 pt-2">
                     Total: <span className="font-semibold">Rs. {order.totalAmount.toFixed(2)}</span>
                   </p>
 
@@ -454,7 +464,12 @@ function App() {
                       <tr key={o._id} className="border-b border-slate-100">
                         <td className="py-2 pr-4 text-slate-500">{o._id.slice(-8)}</td>
                         <td className="py-2 pr-4">
-                          {o.items.map((it) => it.quantity).reduce((a, b) => a + b, 0)} item(s)
+                          {o.items.map((it, idx) => (
+                            <div key={idx} className="text-slate-700">
+                              {it.product?.name || "Deleted product"}{" "}
+                              <span className="text-slate-400">x{it.quantity}</span>
+                            </div>
+                          ))}
                         </td>
                         <td className="py-2 pr-4 font-medium">Rs. {o.totalAmount.toFixed(2)}</td>
                         <td className="py-2 pr-4">
