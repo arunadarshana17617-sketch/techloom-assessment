@@ -1,7 +1,7 @@
 import axios from "axios";
 
-// Local dev backend URL — will be replaced with the live Vercel URL after deployment
-const BASE_URL = "http://localhost:5000/api";
+// Uses the live backend when deployed, falls back to localhost for local development
+const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
 const client = axios.create({
   baseURL: BASE_URL,
