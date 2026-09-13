@@ -118,3 +118,11 @@ Frontend runs at `http://localhost:5173`.
 - Stock reservation uses an atomic `findOneAndUpdate` with a MongoDB `$expr` condition (`stock - reserved >= quantity`), so two simultaneous checkout requests for the same limited-stock item cannot both succeed — one is correctly rejected with a 409 error.
 - All multi-step stock/order mutations (checkout, payment, cancel, refund) run inside MongoDB transactions, so a failure partway through rolls back cleanly instead of leaving stock or order data inconsistent.
 - Reservations expire lazily: any `Reserved` order past its 5-minute window is transitioned to `Expired` (and its stock released) the next time it's read, rather than relying on a background timer — this keeps the app compatible with Vercel's serverless functions.
+- A `withTransactionRetry` helper automatically retries a transaction (up to 4 attempts, with backoff) if MongoDB reports a transient write conflict — this can happen when two requests touch the exact same product document at the same instant. If stock is genuinely unavailable, the user still sees a clean `"Insufficient stock"` message rather than a raw database error.
+
+## ✅ Verification Performed on the Live Production Deployment
+
+Beyond local testing, the following was verified directly against the deployed production URLs before submission:
+
+- **Full checkout → payment → refund flow**, exercised end-to-end on the live frontend against the live backend (not just localhost): add to cart → checkout (`Reserved`, live countdown) → simulate payment success (`Paid`) → refund from Order History (`Refunded`, with amount and reason recorded).
+- **Concurrency / overselling test**, run directly against the production API: a test product was created with `stock: 1`, then two checkout requests for that product were fired at the same time from two parallel PowerShell background jobs. Result: exactly one request succeeded (`Reserved`), the other was rejected with `"Insufficient stock"`, and the product's `reserved` count stayed at `1` — confirming no overselling occurs under real concurrent load, not just in theory.
