@@ -7,6 +7,41 @@ const router = express.Router();
 
 const RESERVATION_MINUTES = 5;
 
+// Runs `fn` inside a fresh MongoDB transaction, automatically retrying a few
+// times if MongoDB reports a transient write conflict (which can happen when
+// two requests touch the same document at the exact same moment). This keeps
+// the "insufficient stock" case as the only error users normally see, instead
+// of a raw database error leaking through under heavy concurrency.
+async function withTransactionRetry(fn, maxAttempts = 4) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const session = await mongoose.startSession();
+    try {
+      session.startTransaction();
+      const result = await fn(session);
+      await session.commitTransaction();
+      return result;
+    } catch (err) {
+      await session.abortTransaction();
+      lastErr = err;
+
+      const isTransient =
+        err.errorLabels?.includes("TransientTransactionError") ||
+        err.code === 112 ||
+        /write conflict/i.test(err.message || "");
+
+      if (!isTransient || attempt === maxAttempts) {
+        throw err;
+      }
+      // brief backoff before retrying, so a retry doesn't immediately collide again
+      await new Promise((r) => setTimeout(r, 30 * attempt));
+    } finally {
+      session.endSession();
+    }
+  }
+  throw lastErr;
+}
+
 // Helper: lazy-expire a single order if its reservation time has passed
 async function expireIfNeeded(order) {
   if (
@@ -14,11 +49,7 @@ async function expireIfNeeded(order) {
     order.expiresAt &&
     order.expiresAt.getTime() < Date.now()
   ) {
-    const session = await mongoose.startSession();
-    try {
-      session.startTransaction();
-
-      // Release reserved stock back to each product
+    await withTransactionRetry(async (session) => {
       for (const item of order.items) {
         await Product.findByIdAndUpdate(
           item.product,
@@ -26,17 +57,9 @@ async function expireIfNeeded(order) {
           { session }
         );
       }
-
       order.status = "Expired";
       await order.save({ session });
-
-      await session.commitTransaction();
-    } catch (err) {
-      await session.abortTransaction();
-      throw err;
-    } finally {
-      session.endSession();
-    }
+    });
   }
   return order;
 }
@@ -59,66 +82,65 @@ router.post("/checkout", async (req, res) => {
     return res.status(200).json(existing); // idempotent: return the same order
   }
 
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
+    const orderId = await withTransactionRetry(async (session) => {
+      let totalAmount = 0;
+      const orderItems = [];
 
-    let totalAmount = 0;
-    const orderItems = [];
+      for (const { productId, quantity } of items) {
+        if (!productId || !quantity || quantity < 1) {
+          throw new Error("Each item needs a valid productId and quantity");
+        }
 
-    for (const { productId, quantity } of items) {
-      if (!productId || !quantity || quantity < 1) {
-        throw new Error("Each item needs a valid productId and quantity");
+        // Atomic conditional update: only reserve if enough available stock exists.
+        // This is what prevents overselling under concurrent requests.
+        const product = await Product.findOneAndUpdate(
+          {
+            _id: productId,
+            $expr: { $gte: [{ $subtract: ["$stock", "$reserved"] }, quantity] },
+          },
+          { $inc: { reserved: quantity } },
+          { new: true, session }
+        );
+
+        if (!product) {
+          throw new Error(`Insufficient stock for product ${productId}`);
+        }
+
+        orderItems.push({
+          product: product._id,
+          quantity,
+          priceAtOrder: product.price,
+        });
+        totalAmount += product.price * quantity;
       }
 
-      // Atomic conditional update: only reserve if enough available stock exists.
-      // This is what prevents overselling under concurrent requests.
-      const product = await Product.findOneAndUpdate(
-        {
-          _id: productId,
-          $expr: { $gte: [{ $subtract: ["$stock", "$reserved"] }, quantity] },
-        },
-        { $inc: { reserved: quantity } },
-        { new: true, session }
+      const now = new Date();
+      const [order] = await Order.create(
+        [
+          {
+            items: orderItems,
+            totalAmount,
+            status: "Reserved",
+            reservedAt: now,
+            expiresAt: new Date(now.getTime() + RESERVATION_MINUTES * 60 * 1000),
+            idempotencyKey,
+            customerName: customerName || "Guest",
+          },
+        ],
+        { session }
       );
 
-      if (!product) {
-        throw new Error(`Insufficient stock for product ${productId}`);
-      }
+      return order._id;
+    });
 
-      orderItems.push({
-        product: product._id,
-        quantity,
-        priceAtOrder: product.price,
-      });
-      totalAmount += product.price * quantity;
-    }
-
-    const now = new Date();
-    const order = await Order.create(
-      [
-        {
-          items: orderItems,
-          totalAmount,
-          status: "Reserved",
-          reservedAt: now,
-          expiresAt: new Date(now.getTime() + RESERVATION_MINUTES * 60 * 1000),
-          idempotencyKey,
-          customerName: customerName || "Guest",
-        },
-      ],
-      { session }
-    );
-
-    await session.commitTransaction();
-
-    const populatedOrder = await Order.findById(order[0]._id).populate("items.product");
+    const populatedOrder = await Order.findById(orderId).populate("items.product");
     res.status(201).json(populatedOrder);
   } catch (err) {
-    await session.abortTransaction();
-    res.status(409).json({ error: err.message });
-  } finally {
-    session.endSession();
+    const message = /insufficient stock/i.test(err.message)
+      ? err.message
+      : "This item just sold out or is temporarily unavailable. Please try again.";
+    res.status(409).json({ error: message });
   }
 });
 
@@ -155,54 +177,48 @@ router.post("/:id/pay", async (req, res) => {
     return res.status(409).json({ error: "A payment has already been attempted for this order" });
   }
 
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
+    await withTransactionRetry(async (session) => {
+      order.paymentAttemptId = paymentAttemptId;
 
-    order.paymentAttemptId = paymentAttemptId;
+      if (outcome === "success") {
+        order.status = "Paid";
+        order.paidAt = new Date();
+        // Convert reserved -> actually sold (decrement both stock and reserved)
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { stock: -item.quantity, reserved: -item.quantity } },
+            { session }
+          );
+        }
+      } else if (outcome === "failure") {
+        order.status = "Failed";
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { reserved: -item.quantity } },
+            { session }
+          );
+        }
+      } else if (outcome === "timeout") {
+        order.status = "Expired";
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { reserved: -item.quantity } },
+            { session }
+          );
+        }
+      }
 
-    if (outcome === "success") {
-      order.status = "Paid";
-      order.paidAt = new Date();
-      // Convert reserved -> actually sold (decrement both stock and reserved)
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { stock: -item.quantity, reserved: -item.quantity } },
-          { session }
-        );
-      }
-    } else if (outcome === "failure") {
-      order.status = "Failed";
-      // Release reserved stock back
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { reserved: -item.quantity } },
-          { session }
-        );
-      }
-    } else if (outcome === "timeout") {
-      order.status = "Expired";
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { reserved: -item.quantity } },
-          { session }
-        );
-      }
-    }
-
-    await order.save({ session });
-    await session.commitTransaction();
+      await order.save({ session });
+    });
 
     const populatedOrder = await Order.findById(order._id).populate("items.product");
     res.json(populatedOrder);
   } catch (err) {
-    await session.abortTransaction();
-    res.status(500).json({ error: err.message });
-  } finally {
-    session.endSession();
+    res.status(500).json({ error: "Could not process this payment right now. Please try again." });
   }
 });
 
@@ -219,42 +235,34 @@ router.post("/:id/cancel", async (req, res) => {
     });
   }
 
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
-
-    if (order.status === "Reserved") {
-      // stock was only reserved, not deducted yet — release the reservation
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { reserved: -item.quantity } },
-          { session }
-        );
+    await withTransactionRetry(async (session) => {
+      if (order.status === "Reserved") {
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { reserved: -item.quantity } },
+            { session }
+          );
+        }
+      } else if (order.status === "Paid") {
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { stock: item.quantity } },
+            { session }
+          );
+        }
       }
-    } else if (order.status === "Paid") {
-      // stock was already deducted — restore it back to available stock
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { stock: item.quantity } },
-          { session }
-        );
-      }
-    }
 
-    order.status = "Cancelled";
-    await order.save({ session });
-
-    await session.commitTransaction();
+      order.status = "Cancelled";
+      await order.save({ session });
+    });
 
     const populatedOrder = await Order.findById(order._id).populate("items.product");
     res.json(populatedOrder);
   } catch (err) {
-    await session.abortTransaction();
-    res.status(500).json({ error: err.message });
-  } finally {
-    session.endSession();
+    res.status(500).json({ error: "Could not cancel this order right now. Please try again." });
   }
 });
 
@@ -278,40 +286,34 @@ router.post("/:id/refund", async (req, res) => {
     });
   }
 
-  const session = await mongoose.startSession();
   try {
-    session.startTransaction();
-
-    // If refunding a still-Paid order, restore stock too (treat as cancel + refund)
-    if (order.status === "Paid") {
-      for (const item of order.items) {
-        await Product.findByIdAndUpdate(
-          item.product,
-          { $inc: { stock: item.quantity } },
-          { session }
-        );
+    await withTransactionRetry(async (session) => {
+      if (order.status === "Paid") {
+        for (const item of order.items) {
+          await Product.findByIdAndUpdate(
+            item.product,
+            { $inc: { stock: item.quantity } },
+            { session }
+          );
+        }
+        order.status = "Cancelled";
       }
-      order.status = "Cancelled";
-    }
 
-    order.refund = {
-      isRefunded: true,
-      refundedAmount: order.totalAmount,
-      refundedAt: new Date(),
-      reason: reason || "Customer requested refund",
-    };
-    order.status = "Refunded";
+      order.refund = {
+        isRefunded: true,
+        refundedAmount: order.totalAmount,
+        refundedAt: new Date(),
+        reason: reason || "Customer requested refund",
+      };
+      order.status = "Refunded";
 
-    await order.save({ session });
-    await session.commitTransaction();
+      await order.save({ session });
+    });
 
     const populatedOrder = await Order.findById(order._id).populate("items.product");
     res.json(populatedOrder);
   } catch (err) {
-    await session.abortTransaction();
-    res.status(500).json({ error: err.message });
-  } finally {
-    session.endSession();
+    res.status(500).json({ error: "Could not process this refund right now. Please try again." });
   }
 });
 
